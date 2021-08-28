@@ -1,107 +1,155 @@
 import random
 import sys
-
-assignedUHF = []
-
-
-def generateFreq():
-    while True:
-        ret = random.randrange(225000, 399750, 25)
-        if ret not in assignedUHF and ret != 243000:
-            return ret
+import argparse
 
 
-def radiomap(file):
-    lines = file.split("\n")
-    for line in lines:
-        if line[:2] != "//" and line != "\r" and line != "":
-            el = line.split(", ")
-            if type(el[1]) == int:
-                assignedUHF.append(el[1])
+class FreqGen(object):
+    """Takes a list of possible frequencies and shuffles them."""
+    def __init__(self, freq_range: list[int]):
+        self.__freqs = list(freq_range)
+        random.shuffle(self.__freqs)
+
+    def next(self):
+        """Get a frequency and mark it as already used."""
+        try:
+            return self.__freqs.pop()
+        except IndexError:
+            raise ValueError('Ran out of frequencies to assign')
 
 
-def stationsils(file, mode):
-    # min 225.00 - max 399.95 / GUARD 243.00
-    lines = file.split("\n")
-    output = ""
+# min 225.00 - max 399.95 / GUARD 243.00
+MIN_UHF_FREQ_KHZ = 225000
+MAX_UHF_FREQ_KHZ = 399750
+FREQ_STEP_KHZ = 25
+GUARD_FREQ_KHZ = 243000
 
-    to_assign = [6, 12, 13,
-                 14]  # randomly assign 6, 12, 13, 14; TwrU/OpsU/GndU/AppU
 
-    if mode:  # if the user wants to keep already assigned ATC frequencies.
-        for line in lines:
-            el = line.split(" ")
-            if "#" not in line and line != "\r" and line != "":
-                for n in to_assign:
-                    if el[n] != "0":
-                        assignedUHF.append(el[n])
+def is_valid_uhf_freq(freq):
+    freq = int(freq)
+    in_range = MIN_UHF_FREQ_KHZ <= freq <= MAX_UHF_FREQ_KHZ
+    is_25_khz_aligned = freq % 25 == 0
+    return in_range and is_25_khz_aligned
 
-    for line in lines:
-        el = line.split(" ")
-        if "#" not in line and line != "\r" and line != "":  # Exclude line conditions
-            if mode:  # if the user wants to keep already assigned ATC frequencies.
-                for n in to_assign:
-                    if el[n] == "0":  # only generate frequencies for unassigned slots
-                        new = generateFreq()
-                        el[n] = new
-                        assignedUHF.append(new)
-            else:  # if the user doesn't care about keeping already assigned ATC frequencies.
-                for n in to_assign:
-                    new = generateFreq()
-                    el[n] = new
-                    assignedUHF.append(new)
 
-            tmpOut = ""
-            for e in el:
-                if tmpOut == "":
-                    tmpOut = e
-                else:
-                    tmpOut = tmpOut + " " + str(e)
-            output = output + tmpOut + "\n"
+def get_assigned_freqs_from_radiomap(file):
+    assigned_uhf_freqs = set()
 
+    for line in file:
+        line = line.strip()
+        line = line.split('//')[0].strip()
+        if line != '':
+            callsign, uhf_freq_khz, victor_freq_khz = [
+                e.strip() for e in line.split(',')
+            ]
+            try:
+                uhf_freq_khz = int(uhf_freq_khz)
+            except ValueError:
+                pass
+            else:
+                assigned_uhf_freqs.add(uhf_freq_khz)
+
+    return assigned_uhf_freqs
+
+
+def generate_stations_ils(f_in, f_out, allowed_frequency_range_khz,
+                          preserve_assigned_freqs):
+
+    # randomly assign 6, 12, 13, 14; TwrU/OpsU/GndU/AppU
+    INDICES_TO_ASSIGN = [6, 12, 13, 14]
+
+    def split_frequency_line(line):
+        line = line.strip()
+        if '#' in line:
+            line_comment = line.split('#')
+            line = line_comment[0].strip()
+            comment = "#" + "#".join(line_comment[1:])
         else:
-            output = output + line + "\n"
+            comment = ""
+        freqs = [x.strip() for x in line.split()]
+        return freqs, comment
 
-    return output
+    def get_already_assigned_freqs():
+        assigned_uhf_freqs = set()
+        for line in f_in:
+            freqs, _ = split_frequency_line(line)
+            if len(freqs) > 0:
+                for idx in INDICES_TO_ASSIGN:
+                    freq = freqs[idx]
+                    if is_valid_uhf_freq(freq):
+                        assigned_uhf_freqs.add(freq)
+        return assigned_uhf_freqs
+
+    if preserve_assigned_freqs:
+        already_assigned = set(get_already_assigned_freqs())
+        allowed_frequency_range_khz -= already_assigned
+        f_in.seek(0)
+
+    freq_gen = FreqGen(allowed_frequency_range_khz)
+
+    for line in f_in:
+        freqs, comment = split_frequency_line(line)
+        out_line = ''
+        if len(freqs) > 0:
+
+            def should_assign(freq):
+                freq = int(freq)
+                nuke_all_freqs = not preserve_assigned_freqs
+                return nuke_all_freqs or not is_valid_uhf_freq(freq)
+
+            to_assign = [
+                n for n in INDICES_TO_ASSIGN if should_assign(freqs[n])
+            ]
+
+            def get_freq(freq, idx, to_assign):
+                if idx in to_assign:
+                    freq = freq_gen.next()
+                return str(freq)
+
+            new_freqs = [
+                get_freq(f, idx, to_assign) for idx, f in enumerate(freqs)
+            ]
+            out_line = ' '.join(new_freqs)
+        out_line = ''.join([out_line, comment, '\n'])
+        f_out.write(out_line)
 
 
-def writeOutput(output):
-    fout = open("new_stations+ils.dat", "w")
-    fout.write(output)
-    fout.close()
+def main():
+    allowed_frequency_range_khz = set(
+        range(MIN_UHF_FREQ_KHZ, MAX_UHF_FREQ_KHZ, FREQ_STEP_KHZ))
+    allowed_frequency_range_khz.remove(GUARD_FREQ_KHZ)
+
+    parser = argparse.ArgumentParser(
+        description='Fill unique UHF frequencies for airbases.')
+
+    parser.add_argument('stations_path',
+                        type=str,
+                        help="Path to the theater's stations+ils.dat file")
+    parser.add_argument('radiomap_path',
+                        type=str,
+                        help="Path to the theater's radiomaps.dat file.")
+
+    parser.add_argument('-o',
+                        '--output',
+                        type=str,
+                        default='new_stations+ils.dat')
+
+    parser.add_argument('-k',
+                        '--keep',
+                        action='store_true',
+                        help='Preserve already-assigned ATC UHF frequencies.')
+
+    args = parser.parse_args()
+
+    with open(args.radiomap_path) as f:
+        assigned_freqs = get_assigned_freqs_from_radiomap(f)
+    allowed_frequency_range_khz -= set(assigned_freqs)
+    fname_in = args.stations_path
+    fname_out = args.output
+
+    with open(fname_in, 'r+') as in_file, open(fname_out, 'w') as out_file:
+        generate_stations_ils(in_file, out_file, allowed_frequency_range_khz,
+                              args.keep)
 
 
-# execution code
-
-arg = sys.argv
-
-if 2 <= len(arg) <= 4:
-    if arg[1] == "--help":
-        print(
-            "port.py [stations+ils.dat] [radiomap.dat] [-k | keep already assigned ATC frequencies]"
-        )
-    else:
-        stationFile = open(arg[1], "r")
-        stationFileStr = stationFile.read()
-        stationFile.close()
-
-        if "-k" in arg:
-            mode = True
-            if len(arg) == 3:
-                writeOutput(stationsils(stationFileStr, mode))
-            elif len(arg) == 4:
-                radioFile = open(arg[2], "r")
-                radioFileStr = radioFile.read()
-                radioFile.close()
-                radiomap(radioFileStr)
-                writeOutput(stationsils(stationFileStr, mode))
-        else:
-            mode = False
-            if len(arg) == 2:
-                writeOutput(stationsils(stationFileStr, mode))
-            elif len(arg) == 3:
-                radioFile = open(arg[2], "r")
-                radioFileStr = radioFile.read()
-                radioFile.close()
-                radiomap(radioFileStr)
-                writeOutput(stationsils(stationFileStr, mode))
+if __name__ == '__main__':
+    main()
